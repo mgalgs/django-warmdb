@@ -1,4 +1,4 @@
-# django-warmdb -- pre-warmed Postgres DB pool for Django tests
+# django-warmdb — pre-warmed Postgres DB pool for Django tests
 
 ## Goal
 Speed up `manage.py test` by reusing a pool of **already-migrated** Postgres databases.
@@ -14,6 +14,7 @@ Instead of creating a test database and running migrations on every run, we:
 - Supporting `--parallel` initially.
 - Supporting DB backends other than Postgres.
 - Replacing Django's test framework (this integrates with `manage.py test`).
+- Supporting multiple database aliases initially (assume `DATABASES["default"]`).
 
 ## Delivery shape
 Implement as a small **Django app** (e.g. `warmdb/`) providing:
@@ -32,14 +33,17 @@ TEST_RUNNER = "warmdb.runner.WarmDBDiscoverRunner"
 - Postgres user has permission to `CREATE DATABASE` and `DROP DATABASE`.
 - Tests are run via `manage.py test` (no pytest runner integration required for v1).
 - No `--parallel` support (runner should error clearly if requested).
+- Django version: **>= 3.2** (so `DATABASES[alias]["TEST"]["MIGRATE"] = False` is available).
 
 ---
 
 # CLI / management command
 
-All state is stored locally in a sqlite database at the project root:
+All state is stored locally in a sqlite database at the project root.
 
-- `./warmdb_state.sqlite3`
+Best-practice: use `settings.BASE_DIR` (rather than the process CWD) so the state file location is stable regardless of where `manage.py` is invoked from.
+
+- `state_path = Path(settings.BASE_DIR) / "warmdb_state.sqlite3"`
 
 Command: `manage.py warmdb <subcommand> [options]`
 
@@ -53,17 +57,19 @@ Options:
 
 Behavior:
 1. Compute a `schema_hash` for the project (see "Schema change detection").
-2. If sqlite state doesn't exist, create it.
+2. Ensure sqlite state exists.
 3. If existing state's `schema_hash` differs from computed hash:
-   - require `--force` OR automatically invalidate + rebuild (pick one behavior; recommended: rebuild automatically but print why).
-4. Create (or recreate) the template DB.
-5. Apply migrations to the template DB.
-6. Create (or recreate) `pool_size` clone DBs from the template DB.
-7. Mark all clones as `ready` in sqlite state.
+   - automatically rebuild everything (equivalent to `invalidate` + `init`) and print why.
+4. If `--force` is provided, rebuild everything even if `schema_hash` matches.
+5. Create (or recreate) the template DB.
+6. Apply migrations to the template DB.
+7. Create (or recreate) `pool_size` clone DBs from the template DB.
+8. Mark all clones as `ready` in sqlite state.
 
 Notes:
 - Prefer Postgres template cloning (`CREATE DATABASE clone TEMPLATE template;`) because it is typically far faster than running migrations.
 - Create/drop databases using Django's database backend machinery (e.g. `_nodb_cursor()`), not shelling out to `psql`.
+- When dropping a database, first terminate existing sessions to avoid `DROP DATABASE` failing.
 
 ## `warmdb status`
 Print pool status at any time.
@@ -80,13 +86,13 @@ Drops all warm DBs (template + clones) and clears local state.
 
 Behavior:
 - Drop template DB and any clone DBs registered in sqlite.
-- Remove `warmdb_state.sqlite3` (or clear all rows).
+- Remove `warmdb_state.sqlite3` (preferred) OR clear all rows.
 
 ---
 
 # Runtime integration (test runner)
 
-Implement `warmdb.runner.WarmDBDiscoverRunner`:
+Implement `warmdb.runner.WarmDBDiscoverRunner`.
 
 ## Startup behavior
 On `manage.py test`:
@@ -108,17 +114,21 @@ On `manage.py test`:
      Run: manage.py warmdb invalidate && manage.py warmdb init
      ```
 
-3. Allocate one `ready` DB from the pool (atomic allocation).
-4. Point Django's test database name at the allocated DB.
-5. Ensure Django does **not** run migrations / create a new DB (the clone is already migrated).
-   - Prefer using Django's official knobs where possible:
-     - set `DATABASES[alias]["TEST"]["NAME"]` to the allocated DB name
-     - set `DATABASES[alias]["TEST"]["MIGRATE"] = False` (Django >= 3.2)
-     - force `keepdb=True` semantics
-   - If the project's Django version doesn't support `TEST.MIGRATE`, override the relevant test DB setup hooks to skip migration steps.
+3. Reject `--parallel`:
+   - If `parallel != 1`, raise a clear error stating warmdb does not support `--parallel` yet.
 
-6. Definitive migration check (optional but recommended):
-   - After connecting to allocated DB, use `MigrationExecutor(connection)` and verify there is no unapplied migration plan.
+4. Allocate one `ready` DB from the pool (atomic allocation).
+   - If none are available:
+     - print current pool status
+     - fail with a message suggesting to wait or increase pool size.
+
+5. Point Django's test database name at the allocated DB.
+   - Set `DATABASES[alias]["TEST"]["NAME"]` to the allocated DB name.
+   - Set `DATABASES[alias]["TEST"]["MIGRATE"] = False`.
+   - Force `keepdb=True` semantics (warmdb owns lifecycle of the clone).
+
+6. Definitive migration check (recommended):
+   - After connecting to the allocated DB, use `MigrationExecutor(connection)` and verify there is no unapplied migration plan.
    - If there are unapplied migrations, fail with the same "invalidate && init" message.
 
 ## Teardown behavior
@@ -131,7 +141,7 @@ On completion:
 
 If recycling fails:
 - mark clone `error` with `last_error`
-- tests should still report failure clearly (but avoid masking original test failures if possible; consider logging a warning and leaving it `error`).
+- avoid masking original test failures if possible (warn loudly on stderr and leave it `error`).
 
 ---
 
@@ -204,11 +214,9 @@ This makes it safe to keep old DBs around if a new init happens, and makes `inva
 ## Fast check (required)
 Compute a `schema_hash` from:
 
-- contents (or stable fingerprint) of all `*/migrations/*.py` files
-  - include relative path + file bytes OR (path, size, mtime) (bytes preferred)
-- optionally include:
-  - Django version
-  - `INSTALLED_APPS` list
+- contents of all `*/migrations/*.py` files
+  - include relative path + file bytes (bytes preferred for correctness)
+- include Django version
 
 Store `schema_hash` in sqlite during `warmdb init`.
 
