@@ -13,7 +13,7 @@ from django.db import connections
 from .exceptions import WarmDBNoReadyDB, WarmDBNotInitialized, WarmDBSchemaChanged
 from .naming import clone_db_name, template_db_name
 from .postgres import create_database_from_template, drop_database
-from .schema import schema_hash_from_migrations
+from .schema import schema_hash_from_migration_files
 from .state import (
     DBRow,
     STATUS_READY,
@@ -25,8 +25,8 @@ def state_path() -> Path:
     return Path(settings.BASE_DIR) / "warmdb_state.sqlite3"
 
 
-def migration_files_for_installed_apps() -> list[Path]:
-    files: list[Path] = []
+def migration_files_for_installed_apps() -> list[tuple[str, Path]]:
+    files: list[tuple[str, Path]] = []
 
     for cfg in apps.get_app_configs():
         mig_dir = Path(cfg.path) / "migrations"
@@ -37,13 +37,16 @@ def migration_files_for_installed_apps() -> list[Path]:
             if p.name.startswith("__"):
                 # include __init__.py? doesn't matter much; keep hashing stable by excluding
                 continue
-            files.append(p)
+
+            rel = p.relative_to(Path(cfg.path)).as_posix()
+            identity = f"{cfg.label}:{rel}"
+            files.append((identity, p))
 
     return files
 
 
 def compute_schema_hash() -> str:
-    return schema_hash_from_migrations(migration_files_for_installed_apps())
+    return schema_hash_from_migration_files(migration_files_for_installed_apps())
 
 
 @contextlib.contextmanager

@@ -28,7 +28,17 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=7",
+  "black>=24.0.0",
+  "pre-commit>=3.0.0",
+  "psycopg[binary]>=3.1",
+  # Constrain Django in dev/test envs so integration tests can run against
+  # older Postgres versions commonly found in local setups.
+  "Django>=3.2,<5.2",
 ]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -38,3 +48,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "integration: opt-in integration tests requiring a real Postgres instance",
+]

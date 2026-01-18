@@ -34,7 +34,10 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         db.settings_dict["TEST"]["MIGRATE"] = False
 
         # Force keepdb semantics; warmdb owns lifecycle.
-        kwargs["keepdb"] = True
+        # Note: Django's internal setup_databases plumbing passes `keepdb` separately,
+        # so we must set the runner attribute (and avoid passing `keepdb` via kwargs).
+        self.keepdb = True
+        kwargs.pop("keepdb", None)
 
         old_config = super().setup_databases(**kwargs)
 
@@ -49,7 +52,8 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         return old_config
 
     def teardown_databases(self, old_config, **kwargs):
-        kwargs["keepdb"] = True
+        self.keepdb = True
+        kwargs.pop("keepdb", None)
 
         try:
             super().teardown_databases(old_config, **kwargs)

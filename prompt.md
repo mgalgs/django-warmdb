@@ -48,7 +48,7 @@ Cloning from a template is typically *much* faster than running migrations.
 ### Lifecycle
 - `warmdb init`: (re)build template DB (run migrations once), then create/refresh N clones from it → mark `ready`
 - test startup: allocate a `ready` clone → mark `in-use`, point Django test connection at it
-- test end: drop & recreate that clone from template (fast) → mark `ready` again  
+- test end: drop & recreate that clone from template (fast) → mark `ready` again
   (you can still show a transient `done` state if you want, but practically you’ll want to recycle immediately so the pool stays full)
 
 ---
