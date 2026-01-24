@@ -16,6 +16,8 @@ from .postgres import create_database_from_template, drop_database
 from .schema import schema_hash_from_migration_files
 from .state import (
     DBRow,
+    STATUS_CONSUMED,
+    STATUS_ERROR,
     STATUS_READY,
     WarmDBState,
 )
@@ -159,7 +161,7 @@ def allocate_clone(*, alias: str = "default") -> tuple[str, str]:
     name = state.allocate_ready()
     if name is None:
         raise WarmDBNoReadyDB(
-            "No warmdb databases are ready. Run: manage.py warmdb status"
+            "No warmdb databases are ready. Pool exhausted. Run: manage.py warmdb refresh"
         )
 
     template = state.get_meta("template_db_name")
@@ -169,3 +171,61 @@ def allocate_clone(*, alias: str = "default") -> tuple[str, str]:
         )
 
     return name, template
+
+
+def refresh_pool(*, alias: str = "default") -> None:
+    """Refresh the warmdb pool.
+
+    If the schema hash matches the stored state, repopulate consumed/error clones.
+    If the schema hash differs, auto-invalidate and reinitialize the pool.
+    """
+
+    state = WarmDBState(state_path())
+    load_state_or_fail(state)
+
+    current_hash = compute_schema_hash()
+    stored_hash = state.get_meta("schema_hash")
+
+    # Schema changed: full reinit.
+    if stored_hash != current_hash:
+        prefix = state.get_meta("prefix") or "warmdb"
+        pool_size = int(state.get_meta("pool_size") or "5")
+        invalidate_pool(alias=alias)
+        init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
+        return
+
+    template = state.get_meta("template_db_name")
+    if not template:
+        raise WarmDBNotInitialized(
+            "warmdb is not initialized. Run: manage.py warmdb init"
+        )
+
+    prefix = state.get_meta("prefix") or "warmdb"
+    pool_size = int(state.get_meta("pool_size") or "5")
+
+    existing_clones = state.list_dbs()
+
+    # Repopulate consumed/error clones.
+    for clone in existing_clones:
+        if clone.status in (STATUS_CONSUMED, STATUS_ERROR):
+            drop_database(alias, clone.name)
+            create_database_from_template(alias, clone.name, template)
+            state.mark_ready(clone.name)
+
+    # Backfill missing rows if state is short for any reason.
+    if len(existing_clones) < pool_size:
+        for i in range(len(existing_clones) + 1, pool_size + 1):
+            name = clone_db_name(prefix, current_hash, i)
+            create_database_from_template(alias, name, template)
+            state.upsert_dbs(
+                [
+                    DBRow(
+                        name=name,
+                        status=STATUS_READY,
+                        allocated_to_pid=None,
+                        allocated_at=None,
+                        last_error=None,
+                        schema_hash=current_hash,
+                    )
+                ]
+            )

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from django.core.management.base import BaseCommand
 
-from warmdb.core import init_pool, invalidate_pool
-from warmdb.state import WarmDBState
+from warmdb.core import init_pool, invalidate_pool, refresh_pool
+from warmdb.state import (
+    STATUS_CONSUMED,
+    STATUS_ERROR,
+    STATUS_IN_USE,
+    STATUS_READY,
+    WarmDBState,
+)
 
 
 class Command(BaseCommand):
@@ -12,7 +18,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "subcommand",
-            choices=["init", "status", "invalidate"],
+            choices=["init", "status", "invalidate", "refresh"],
             help="Subcommand to run",
         )
 
@@ -47,18 +53,34 @@ class Command(BaseCommand):
 
             self.stdout.write(f"template: {template}")
             self.stdout.write(f"schema_hash: {schema_hash}")
-            for r in state.list_dbs():
+
+            dbs = state.list_dbs()
+            for r in dbs:
                 extra = ""
-                if r.status == "in-use":
+                if r.status == STATUS_IN_USE:
                     extra = f" pid={r.allocated_to_pid} at={r.allocated_at}"
-                if r.status == "error" and r.last_error:
+                if r.status == STATUS_ERROR and r.last_error:
                     extra = f" error={r.last_error}"
                 self.stdout.write(f"{r.name}: {r.status}{extra}")
+
+            ready = sum(1 for db in dbs if db.status == STATUS_READY)
+            in_use = sum(1 for db in dbs if db.status == STATUS_IN_USE)
+            consumed = sum(1 for db in dbs if db.status == STATUS_CONSUMED)
+            error = sum(1 for db in dbs if db.status == STATUS_ERROR)
+            self.stdout.write(
+                f"\nSummary: {ready} ready, {in_use} in-use, {consumed} consumed, {error} error"
+            )
+
             return
 
         if subcommand == "invalidate":
             invalidate_pool()
             self.stdout.write(self.style.SUCCESS("warmdb invalidated"))
+            return
+
+        if subcommand == "refresh":
+            refresh_pool()
+            self.stdout.write(self.style.SUCCESS("warmdb pool refreshed"))
             return
 
         raise RuntimeError(f"Unknown subcommand: {subcommand}")

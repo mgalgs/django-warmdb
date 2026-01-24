@@ -11,6 +11,7 @@ from typing import Iterable, Iterator, Optional
 STATUS_INITIALIZING = "initializing"
 STATUS_READY = "ready"
 STATUS_IN_USE = "in-use"
+STATUS_CONSUMED = "consumed"
 STATUS_ERROR = "error"
 
 
@@ -130,6 +131,15 @@ class WarmDBState:
             conn.execute(
                 "UPDATE dbs SET status=?, allocated_to_pid=NULL, allocated_at=NULL, last_error=NULL WHERE name=?",
                 (STATUS_READY, name),
+            )
+
+    def mark_consumed(self, name: str) -> None:
+        if not self.exists():
+            return
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE dbs SET status=?, allocated_to_pid=NULL, allocated_at=NULL, last_error=NULL WHERE name=?",
+                (STATUS_CONSUMED, name),
             )
 
     def mark_error(self, name: str, error: str) -> None:
