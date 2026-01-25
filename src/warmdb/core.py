@@ -78,7 +78,7 @@ def ensure_schema_hash_matches(state: WarmDBState, current_schema_hash: str) -> 
         )
     if stored != current_schema_hash:
         raise WarmDBSchemaChanged(
-            "Schema changed since warmdb init.\nRun: manage.py warmdb invalidate && manage.py warmdb init"
+            "Schema changed since warmdb init.\nRun: manage.py warmdb refresh"
         )
 
 

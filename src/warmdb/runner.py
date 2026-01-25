@@ -50,7 +50,7 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
         if plan:
             raise WarmDBSchemaChanged(
-                "Schema changed since warmdb init.\nRun: manage.py warmdb invalidate && manage.py warmdb init"
+                "Schema changed since warmdb init.\nRun: manage.py warmdb refresh"
             )
 
         return old_config
