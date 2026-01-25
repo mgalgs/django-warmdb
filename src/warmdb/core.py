@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from django.apps import apps
 from django.conf import settings
@@ -173,7 +173,11 @@ def allocate_clone(*, alias: str = "default") -> tuple[str, str]:
     return name, template
 
 
-def refresh_pool(*, alias: str = "default") -> None:
+def refresh_pool(
+    *,
+    alias: str = "default",
+    log: Callable[[str], None] | None = None,
+) -> None:
     """Refresh the warmdb pool.
 
     If the schema hash matches the stored state, repopulate consumed/error clones.
@@ -186,10 +190,23 @@ def refresh_pool(*, alias: str = "default") -> None:
     current_hash = compute_schema_hash()
     stored_hash = state.get_meta("schema_hash")
 
+    if log:
+        log(
+            "warmdb refresh: "
+            f"current_schema_hash={current_hash} stored_schema_hash={stored_hash}"
+        )
+
     # Schema changed: full reinit.
     if stored_hash != current_hash:
         prefix = state.get_meta("prefix") or "warmdb"
         pool_size = int(state.get_meta("pool_size") or "5")
+
+        if log:
+            log(
+                "warmdb refresh: schema changed; reinitializing pool "
+                f"(pool_size={pool_size} prefix={prefix})"
+            )
+
         invalidate_pool(alias=alias)
         init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
         return
@@ -205,17 +222,36 @@ def refresh_pool(*, alias: str = "default") -> None:
 
     existing_clones = state.list_dbs()
 
+    to_recreate = [
+        clone
+        for clone in existing_clones
+        if clone.status in (STATUS_CONSUMED, STATUS_ERROR)
+    ]
+
+    if log:
+        consumed = sum(1 for db in existing_clones if db.status == STATUS_CONSUMED)
+        error = sum(1 for db in existing_clones if db.status == STATUS_ERROR)
+        log(
+            "warmdb refresh: "
+            f"{len(to_recreate)} clones to recreate "
+            f"({consumed} consumed, {error} error); "
+            f"existing={len(existing_clones)} target_pool_size={pool_size}"
+        )
+
     # Repopulate consumed/error clones.
-    for clone in existing_clones:
-        if clone.status in (STATUS_CONSUMED, STATUS_ERROR):
-            drop_database(alias, clone.name)
-            create_database_from_template(alias, clone.name, template)
-            state.mark_ready(clone.name)
+    for clone in to_recreate:
+        if log:
+            log(f"warmdb refresh: recreating {clone.name} (was {clone.status})")
+        drop_database(alias, clone.name)
+        create_database_from_template(alias, clone.name, template)
+        state.mark_ready(clone.name)
 
     # Backfill missing rows if state is short for any reason.
     if len(existing_clones) < pool_size:
         for i in range(len(existing_clones) + 1, pool_size + 1):
             name = clone_db_name(prefix, current_hash, i)
+            if log:
+                log(f"warmdb refresh: creating missing clone {name}")
             create_database_from_template(alias, name, template)
             state.upsert_dbs(
                 [
@@ -229,3 +265,6 @@ def refresh_pool(*, alias: str = "default") -> None:
                     )
                 ]
             )
+
+    if log:
+        log("warmdb refresh: done")

@@ -79,7 +79,7 @@ class Command(BaseCommand):
             return
 
         if subcommand == "refresh":
-            refresh_pool()
+            refresh_pool(log=self.stdout.write)
             self.stdout.write(self.style.SUCCESS("warmdb pool refreshed"))
             return
 
