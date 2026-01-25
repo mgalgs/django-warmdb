@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import sys
 
+from django.core.management import CommandError
 from django.db import connections
 from django.db.migrations.executor import MigrationExecutor
 from django.test.runner import DiscoverRunner
 
 from .core import allocate_clone
-from .exceptions import WarmDBSchemaChanged
+from .exceptions import WarmDBNoReadyDB, WarmDBSchemaChanged
 from .postgres import drop_database
 from .state import WarmDBState
 
@@ -23,7 +24,12 @@ class WarmDBDiscoverRunner(DiscoverRunner):
             raise RuntimeError("warmdb does not support --parallel yet")
 
         # Allocate clone and re-point test DB.
-        allocated, _template = allocate_clone(alias="default")
+        try:
+            allocated, _template = allocate_clone(alias="default")
+        except WarmDBNoReadyDB as e:
+            # Ensure `manage.py test` shows just the error message (no traceback).
+            raise CommandError(str(e)) from None
+
         self._warmdb_allocated_name = allocated
 
         db = connections["default"]
