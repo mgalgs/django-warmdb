@@ -30,10 +30,12 @@ class Command(BaseCommand):
         subcommand = options["subcommand"]
 
         if subcommand == "init":
+            log = self.stdout.write if int(options.get("verbosity", 1)) >= 1 else None
             init_pool(
                 pool_size=int(options["pool_size"]),
                 force=bool(options["force"]),
                 prefix=str(options["prefix"]),
+                log=log,
             )
             self.stdout.write(self.style.SUCCESS("warmdb init complete"))
             return

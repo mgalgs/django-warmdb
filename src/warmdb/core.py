@@ -88,6 +88,7 @@ def init_pool(
     pool_size: int = 5,
     force: bool = False,
     prefix: str = "warmdb",
+    log: Callable[[str], None] | None = None,
 ) -> None:
     state = WarmDBState(state_path())
     state.ensure_schema()
@@ -95,12 +96,23 @@ def init_pool(
     current_hash = compute_schema_hash()
     stored_hash = state.get_meta("schema_hash")
 
+    if log:
+        log(
+            "warmdb init: "
+            f"current_schema_hash={current_hash} stored_schema_hash={stored_hash} "
+            f"pool_size={pool_size} prefix={prefix} force={force}"
+        )
+
     if force or (stored_hash is not None and stored_hash != current_hash):
         # Best-effort clean.
+        if log:
+            log("warmdb init: invalidating existing pool")
         invalidate_pool(alias=alias)
         state.ensure_schema()
 
     tmpl = template_db_name(prefix, current_hash)
+    if log:
+        log(f"warmdb init: creating template {tmpl}")
     drop_database(alias, tmpl)
 
     with connections[alias]._nodb_cursor():
@@ -112,12 +124,20 @@ def init_pool(
 
     create_database(alias, tmpl)
 
+    if log:
+        log(f"warmdb init: running migrations on template {tmpl}")
+
     with _override_database_name(alias, tmpl):
         call_command("migrate", database=alias, interactive=False, verbosity=1)
 
     clones = [clone_db_name(prefix, current_hash, i) for i in range(1, pool_size + 1)]
 
+    if log:
+        log(f"warmdb init: creating {len(clones)} clones from template {tmpl}")
+
     for c in clones:
+        if log:
+            log(f"warmdb init: cloning {c}")
         drop_database(alias, c)
         create_database_from_template(alias, c, tmpl)
 
@@ -138,6 +158,9 @@ def init_pool(
         )
         for c in clones
     )
+
+    if log:
+        log("warmdb init: pool ready")
 
 
 def invalidate_pool(*, alias: str = "default") -> None:
@@ -208,7 +231,10 @@ def refresh_pool(
             )
 
         invalidate_pool(alias=alias)
-        init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
+        if log:
+            init_pool(alias=alias, pool_size=pool_size, prefix=prefix, log=log)
+        else:
+            init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
         return
 
     template = state.get_meta("template_db_name")
