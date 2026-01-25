@@ -8,7 +8,7 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test.runner import DiscoverRunner
 
 from .core import allocate_clone
-from .exceptions import WarmDBNoReadyDB, WarmDBSchemaChanged
+from .exceptions import WarmDBNoReadyDB, WarmDBNotInitialized, WarmDBSchemaChanged
 from .postgres import drop_database
 from .state import WarmDBState
 
@@ -27,6 +27,9 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         try:
             allocated, _template = allocate_clone(alias="default")
         except WarmDBNoReadyDB as e:
+            # Ensure `manage.py test` shows just the error message (no traceback).
+            raise CommandError(str(e)) from None
+        except WarmDBNotInitialized as e:
             # Ensure `manage.py test` shows just the error message (no traceback).
             raise CommandError(str(e)) from None
 
@@ -49,7 +52,7 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         executor = MigrationExecutor(db)
         plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
         if plan:
-            raise WarmDBSchemaChanged(
+            raise CommandError(
                 "Schema changed since warmdb init.\nRun: manage.py warmdb refresh"
             )
 
