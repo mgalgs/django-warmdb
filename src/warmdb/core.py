@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import os
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -20,11 +21,31 @@ from .state import (
     STATUS_ERROR,
     STATUS_READY,
     WarmDBState,
+    OP_INIT,
+    OP_REFRESH,
+    OP_INVALIDATE,
 )
 
 
 def state_path() -> Path:
     return Path(settings.BASE_DIR) / "warmdb_state.sqlite3"
+
+
+@contextlib.contextmanager
+def operation_lock(state: WarmDBState, op_type: str):
+    """Context manager for acquiring and releasing an operation lock."""
+    # Check if we're already holding a lock for the same process
+    current = state.get_operation()
+    if current and current[1] == os.getpid():
+        # Already holding a lock, don't re-acquire (reentrant)
+        yield
+        return
+
+    token = state.acquire_operation_lock(op_type)
+    try:
+        yield
+    finally:
+        state.clear_operation(token=token)
 
 
 def migration_files_for_installed_apps() -> list[tuple[str, Path]]:
@@ -93,85 +114,94 @@ def init_pool(
     state = WarmDBState(state_path())
     state.ensure_schema()
 
-    current_hash = compute_schema_hash()
-    stored_hash = state.get_meta("schema_hash")
+    with operation_lock(state, OP_INIT):
+        current_hash = compute_schema_hash()
+        stored_hash = state.get_meta("schema_hash")
 
-    if log:
-        log(
-            "warmdb init: "
-            f"current_schema_hash={current_hash} stored_schema_hash={stored_hash} "
-            f"pool_size={pool_size} prefix={prefix} force={force}"
+        if log:
+            log(
+                "warmdb init: "
+                f"current_schema_hash={current_hash} stored_schema_hash={stored_hash} "
+                f"pool_size={pool_size} prefix={prefix} force={force}"
+            )
+
+        if force or (stored_hash is not None and stored_hash != current_hash):
+            # Best-effort clean.
+            if log:
+                log("warmdb init: invalidating existing pool")
+            invalidate_pool(alias=alias)
+            state.ensure_schema()
+
+        tmpl = template_db_name(prefix, current_hash)
+        if log:
+            log(f"warmdb init: creating template {tmpl}")
+        drop_database(alias, tmpl)
+
+        with connections[alias]._nodb_cursor():
+            # Ensure nodb connection is available early (sanity).
+            pass
+
+        # Re-create and migrate template.
+        from .postgres import create_database
+
+        create_database(alias, tmpl)
+
+        if log:
+            log(f"warmdb init: running migrations on template {tmpl}")
+
+        with _override_database_name(alias, tmpl):
+            call_command("migrate", database=alias, interactive=False, verbosity=1)
+
+        clones = [
+            clone_db_name(prefix, current_hash, i) for i in range(1, pool_size + 1)
+        ]
+
+        if log:
+            log(f"warmdb init: creating {len(clones)} clones from template {tmpl}")
+
+        for c in clones:
+            if log:
+                log(f"warmdb init: cloning {c}")
+            drop_database(alias, c)
+            create_database_from_template(alias, c, tmpl)
+
+        state.set_meta("schema_hash", current_hash)
+        state.set_meta("template_db_name", tmpl)
+        state.set_meta("pool_size", str(pool_size))
+        state.set_meta("prefix", prefix)
+        state.set_meta("created_at", _dt.datetime.now(tz=_dt.timezone.utc).isoformat())
+
+        state.upsert_dbs(
+            DBRow(
+                name=c,
+                status=STATUS_READY,
+                allocated_to_pid=None,
+                allocated_at=None,
+                last_error=None,
+                schema_hash=current_hash,
+            )
+            for c in clones
         )
 
-    if force or (stored_hash is not None and stored_hash != current_hash):
-        # Best-effort clean.
         if log:
-            log("warmdb init: invalidating existing pool")
-        invalidate_pool(alias=alias)
-        state.ensure_schema()
-
-    tmpl = template_db_name(prefix, current_hash)
-    if log:
-        log(f"warmdb init: creating template {tmpl}")
-    drop_database(alias, tmpl)
-
-    with connections[alias]._nodb_cursor():
-        # Ensure nodb connection is available early (sanity).
-        pass
-
-    # Re-create and migrate template.
-    from .postgres import create_database
-
-    create_database(alias, tmpl)
-
-    if log:
-        log(f"warmdb init: running migrations on template {tmpl}")
-
-    with _override_database_name(alias, tmpl):
-        call_command("migrate", database=alias, interactive=False, verbosity=1)
-
-    clones = [clone_db_name(prefix, current_hash, i) for i in range(1, pool_size + 1)]
-
-    if log:
-        log(f"warmdb init: creating {len(clones)} clones from template {tmpl}")
-
-    for c in clones:
-        if log:
-            log(f"warmdb init: cloning {c}")
-        drop_database(alias, c)
-        create_database_from_template(alias, c, tmpl)
-
-    state.set_meta("schema_hash", current_hash)
-    state.set_meta("template_db_name", tmpl)
-    state.set_meta("pool_size", str(pool_size))
-    state.set_meta("prefix", prefix)
-    state.set_meta("created_at", _dt.datetime.now(tz=_dt.timezone.utc).isoformat())
-
-    state.upsert_dbs(
-        DBRow(
-            name=c,
-            status=STATUS_READY,
-            allocated_to_pid=None,
-            allocated_at=None,
-            last_error=None,
-            schema_hash=current_hash,
-        )
-        for c in clones
-    )
-
-    if log:
-        log("warmdb init: pool ready")
+            log("warmdb init: pool ready")
 
 
 def invalidate_pool(*, alias: str = "default") -> None:
     state = WarmDBState(state_path())
-    if state.exists():
-        template = state.get_meta("template_db_name")
-        for r in state.list_dbs():
-            drop_database(alias, r.name)
-        if template:
-            drop_database(alias, template)
-        state.clear()
+    with operation_lock(state, OP_INVALIDATE):
+        if state.exists():
+            template = state.get_meta("template_db_name")
+            for r in state.list_dbs():
+                drop_database(alias, r.name)
+            if template:
+                drop_database(alias, template)
+            # Truncate tables instead of deleting the file so the
+            # operation lock row survives for the caller's context
+            # manager (e.g. refresh -> invalidate -> init).
+            with state.connect() as conn:
+                conn.execute("DELETE FROM dbs")
+                conn.execute("DELETE FROM meta WHERE key != 'operation'")
 
 
 def allocate_clone(*, alias: str = "default") -> tuple[str, str]:
@@ -210,87 +240,93 @@ def refresh_pool(
     state = WarmDBState(state_path())
     load_state_or_fail(state)
 
-    current_hash = compute_schema_hash()
-    stored_hash = state.get_meta("schema_hash")
-
-    if log:
-        log(
-            "warmdb refresh: "
-            f"current_schema_hash={current_hash} stored_schema_hash={stored_hash}"
-        )
-
-    # Schema changed: full reinit.
-    if stored_hash != current_hash:
-        prefix = state.get_meta("prefix") or "warmdb"
-        pool_size = int(state.get_meta("pool_size") or "5")
+    with operation_lock(state, OP_REFRESH):
+        current_hash = compute_schema_hash()
+        stored_hash = state.get_meta("schema_hash")
 
         if log:
             log(
-                "warmdb refresh: schema changed; reinitializing pool "
-                f"(pool_size={pool_size} prefix={prefix})"
+                "warmdb refresh: "
+                f"current_schema_hash={current_hash} stored_schema_hash={stored_hash}"
             )
 
-        invalidate_pool(alias=alias)
-        if log:
-            init_pool(alias=alias, pool_size=pool_size, prefix=prefix, log=log)
-        else:
-            init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
-        return
+        # Schema changed: full reinit.
+        if stored_hash != current_hash:
+            prefix = state.get_meta("prefix") or "warmdb"
+            pool_size = int(state.get_meta("pool_size") or "5")
 
-    template = state.get_meta("template_db_name")
-    if not template:
-        raise WarmDBNotInitialized(
-            "warmdb is not initialized. Run: manage.py warmdb init"
-        )
-
-    prefix = state.get_meta("prefix") or "warmdb"
-    pool_size = int(state.get_meta("pool_size") or "5")
-
-    existing_clones = state.list_dbs()
-
-    to_recreate = [
-        clone
-        for clone in existing_clones
-        if clone.status in (STATUS_CONSUMED, STATUS_ERROR)
-    ]
-
-    if log:
-        consumed = sum(1 for db in existing_clones if db.status == STATUS_CONSUMED)
-        error = sum(1 for db in existing_clones if db.status == STATUS_ERROR)
-        log(
-            "warmdb refresh: "
-            f"{len(to_recreate)} clones to recreate "
-            f"({consumed} consumed, {error} error); "
-            f"existing={len(existing_clones)} target_pool_size={pool_size}"
-        )
-
-    # Repopulate consumed/error clones.
-    for clone in to_recreate:
-        if log:
-            log(f"warmdb refresh: recreating {clone.name} (was {clone.status})")
-        drop_database(alias, clone.name)
-        create_database_from_template(alias, clone.name, template)
-        state.mark_ready(clone.name)
-
-    # Backfill missing rows if state is short for any reason.
-    if len(existing_clones) < pool_size:
-        for i in range(len(existing_clones) + 1, pool_size + 1):
-            name = clone_db_name(prefix, current_hash, i)
             if log:
-                log(f"warmdb refresh: creating missing clone {name}")
-            create_database_from_template(alias, name, template)
-            state.upsert_dbs(
-                [
-                    DBRow(
-                        name=name,
-                        status=STATUS_READY,
-                        allocated_to_pid=None,
-                        allocated_at=None,
-                        last_error=None,
-                        schema_hash=current_hash,
-                    )
-                ]
+                log(
+                    "warmdb refresh: schema changed; reinitializing pool "
+                    f"(pool_size={pool_size} prefix={prefix})"
+                )
+
+            invalidate_pool(alias=alias)
+            if log:
+                init_pool(alias=alias, pool_size=pool_size, prefix=prefix, log=log)
+            else:
+                init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
+            return
+
+        template = state.get_meta("template_db_name")
+        if not template:
+            raise WarmDBNotInitialized(
+                "warmdb is not initialized. Run: manage.py warmdb init"
             )
 
-    if log:
-        log("warmdb refresh: done")
+        prefix = state.get_meta("prefix") or "warmdb"
+        pool_size = int(state.get_meta("pool_size") or "5")
+
+        # Reclaim clones stuck as in-use by dead processes.
+        reclaimed = state.reclaim_stale_in_use()
+        if reclaimed and log:
+            log(f"warmdb refresh: reclaimed {reclaimed} stale in-use clone(s)")
+
+        existing_clones = state.list_dbs()
+
+        to_recreate = [
+            clone
+            for clone in existing_clones
+            if clone.status in (STATUS_CONSUMED, STATUS_ERROR)
+        ]
+
+        if log:
+            consumed = sum(1 for db in existing_clones if db.status == STATUS_CONSUMED)
+            error = sum(1 for db in existing_clones if db.status == STATUS_ERROR)
+            log(
+                "warmdb refresh: "
+                f"{len(to_recreate)} clones to recreate "
+                f"({consumed} consumed, {error} error); "
+                f"existing={len(existing_clones)} target_pool_size={pool_size}"
+            )
+
+        # Repopulate consumed/error clones.
+        for clone in to_recreate:
+            if log:
+                log(f"warmdb refresh: recreating {clone.name} (was {clone.status})")
+            drop_database(alias, clone.name)
+            create_database_from_template(alias, clone.name, template)
+            state.mark_ready(clone.name)
+
+        # Backfill missing rows if state is short for any reason.
+        if len(existing_clones) < pool_size:
+            for i in range(len(existing_clones) + 1, pool_size + 1):
+                name = clone_db_name(prefix, current_hash, i)
+                if log:
+                    log(f"warmdb refresh: creating missing clone {name}")
+                create_database_from_template(alias, name, template)
+                state.upsert_dbs(
+                    [
+                        DBRow(
+                            name=name,
+                            status=STATUS_READY,
+                            allocated_to_pid=None,
+                            allocated_at=None,
+                            last_error=None,
+                            schema_hash=current_hash,
+                        )
+                    ]
+                )
+
+        if log:
+            log("warmdb refresh: done")

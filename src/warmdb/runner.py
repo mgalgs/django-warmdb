@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 
+from django.conf import settings
 from django.core.management import CommandError
 from django.db import connections
 from django.db.migrations.executor import MigrationExecutor
@@ -27,36 +28,37 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         try:
             allocated, _template = allocate_clone(alias="default")
         except WarmDBNoReadyDB as e:
-            # Ensure `manage.py test` shows just the error message (no traceback).
             raise CommandError(str(e)) from None
         except WarmDBNotInitialized as e:
-            # Ensure `manage.py test` shows just the error message (no traceback).
             raise CommandError(str(e)) from None
 
         self._warmdb_allocated_name = allocated
 
-        db = connections["default"]
-        db.settings_dict.setdefault("TEST", {})
-        db.settings_dict["TEST"]["NAME"] = allocated
-        db.settings_dict["TEST"]["MIGRATE"] = False
+        try:
+            # Point the default connection at the allocated clone.
+            db = connections["default"]
+            settings.DATABASES["default"]["NAME"] = allocated
+            db.settings_dict["NAME"] = allocated
 
-        # Force keepdb semantics; warmdb owns lifecycle.
-        # Note: Django's internal setup_databases plumbing passes `keepdb` separately,
-        # so we must set the runner attribute (and avoid passing `keepdb` via kwargs).
-        self.keepdb = True
-        kwargs.pop("keepdb", None)
+            # Ensure the connection uses the new name.
+            db.close()
 
-        old_config = super().setup_databases(**kwargs)
+            # Definitive check: ensure no unapplied migrations.
+            executor = MigrationExecutor(db)
+            plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+            if plan:
+                raise CommandError(
+                    "Schema changed since warmdb init.\nRun: manage.py warmdb refresh"
+                )
+        except Exception:
+            # Clean up the allocated clone so it doesn't stay stuck as in-use.
+            self._consume_allocated_clone()
+            raise
 
-        # Definitive check: ensure no unapplied migrations.
-        executor = MigrationExecutor(db)
-        plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
-        if plan:
-            raise CommandError(
-                "Schema changed since warmdb init.\nRun: manage.py warmdb refresh"
-            )
-
-        return old_config
+        # Return the config Django expects for teardown.  The format is a list
+        # of (connection, old_name, destroy) tuples.  We set destroy=False
+        # because warmdb owns the lifecycle.
+        return [(db, allocated, False)]
 
     def teardown_databases(self, old_config, **kwargs):
         self.keepdb = True

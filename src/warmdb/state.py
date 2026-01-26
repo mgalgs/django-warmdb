@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import secrets
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Iterable, Iterator, Optional
 
+if TYPE_CHECKING:
+    import contextlib as _ctx
 
 STATUS_INITIALIZING = "initializing"
 STATUS_READY = "ready"
 STATUS_IN_USE = "in-use"
 STATUS_CONSUMED = "consumed"
 STATUS_ERROR = "error"
+
+# Operation types for locking
+OP_NONE = "none"
+OP_INIT = "init"
+OP_REFRESH = "refresh"
+OP_INVALIDATE = "invalidate"
 
 
 @dataclass(frozen=True)
@@ -254,3 +264,128 @@ class WarmDBState:
                     "UPDATE dbs SET status=?, allocated_to_pid=NULL, allocated_at=NULL WHERE name=?",
                     (STATUS_READY, r["name"]),
                 )
+
+    def get_operation(self) -> tuple[str, int | None, str | None] | None:
+        """Get current operation: (operation_type, pid, started_at) or None."""
+        if not self.exists():
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                ("operation",),
+            ).fetchone()
+            if not row:
+                return None
+            return self._parse_operation_value(str(row["value"]))
+
+    @staticmethod
+    def _parse_operation_value(
+        value: str,
+    ) -> tuple[str, int | None, str | None] | None:
+        """Parse an operation meta value into (op_type, pid, started_at).
+
+        Supports both legacy 3-part (op:pid:ts) and new 4-part
+        (op:pid:ts:token) formats.
+        """
+        parts = value.split(":", 3)
+        if len(parts) < 3:
+            return None
+        op_type, pid_str, started_at = parts[0], parts[1], parts[2]
+        return (op_type, int(pid_str) if pid_str else None, started_at)
+
+    def clear_operation(self, *, token: str | None = None) -> None:
+        """Clear the current operation, only if *token* matches (when given)."""
+        if not self.exists():
+            return
+        with self.connect() as conn:
+            if token is not None:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key=?",
+                    ("operation",),
+                ).fetchone()
+                if not row or not str(row["value"]).endswith(f":{token}"):
+                    return
+            conn.execute("DELETE FROM meta WHERE key=?", ("operation",))
+
+    def is_operation_valid(self, operation: tuple[str, int | None, str | None]) -> bool:
+        """Check if an operation entry is still valid (PID alive and not stale)."""
+        if operation is None:
+            return False
+        op_type, pid, started_at = operation
+        if pid is None:
+            return False
+        # Check if PID is alive
+        if not self._pid_alive(int(pid)):
+            return False
+        # Check if operation is stale (more than 2 hours)
+        if started_at:
+            try:
+                ts = _dt.datetime.fromisoformat(str(started_at))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_dt.timezone.utc)
+                if (
+                    _dt.datetime.now(tz=_dt.timezone.utc) - ts
+                ).total_seconds() > 2 * 60 * 60:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def acquire_operation_lock(
+        self,
+        op_type: str,
+        *,
+        wait_timeout_seconds: int = 60,
+        poll_interval_seconds: float = 0.5,
+    ) -> str:
+        """Acquire an operation lock atomically. Returns a token for release.
+
+        Uses ``BEGIN IMMEDIATE`` so that the check-and-set happens inside a
+        single SQLite write transaction, preventing two processes from both
+        observing "free" and both proceeding.
+
+        Raises:
+            RuntimeError: if timeout is exceeded
+        """
+        start = time.time()
+        pid = os.getpid()
+        token = secrets.token_hex(16)
+
+        while True:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM meta WHERE key=?",
+                        ("operation",),
+                    ).fetchone()
+
+                    current = None
+                    if row:
+                        current = self._parse_operation_value(str(row["value"]))
+
+                    if current is None or not self.is_operation_valid(current):
+                        started_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                            (
+                                "operation",
+                                f"{op_type}:{pid}:{started_at}:{token}",
+                            ),
+                        )
+                        conn.execute("COMMIT")
+                        return token
+
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+
+            if time.time() - start >= wait_timeout_seconds:
+                held_by_op, held_by_pid, held_since = current  # type: ignore[misc]
+                raise RuntimeError(
+                    f"Cannot acquire {op_type} lock: operation {held_by_op} "
+                    f"held by PID {held_by_pid} since {held_since} "
+                    f"(timeout after {wait_timeout_seconds}s)"
+                )
+            time.sleep(poll_interval_seconds)
