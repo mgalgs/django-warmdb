@@ -169,6 +169,11 @@ class WarmDBState:
         return True
 
     def reclaim_stale_in_use(self, *, ttl_seconds: int | None = 4 * 60 * 60) -> int:
+        """Reclaim clones stuck as in-use by dead/stale processes.
+
+        Not wrapped in BEGIN IMMEDIATE because the UPDATE is idempotent —
+        two concurrent callers reclaiming the same row is harmless.
+        """
         if not self.exists():
             return 0
 

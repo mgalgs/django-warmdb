@@ -27,9 +27,7 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         # Allocate clone and re-point test DB.
         try:
             allocated, _template = allocate_clone(alias="default")
-        except WarmDBNoReadyDB as e:
-            raise CommandError(str(e)) from None
-        except WarmDBNotInitialized as e:
+        except (WarmDBNoReadyDB, WarmDBNotInitialized, WarmDBSchemaChanged) as e:
             raise CommandError(str(e)) from None
 
         self._warmdb_allocated_name = allocated
@@ -37,6 +35,7 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         try:
             # Point the default connection at the allocated clone.
             db = connections["default"]
+            original_name = settings.DATABASES["default"]["NAME"]
             settings.DATABASES["default"]["NAME"] = allocated
             db.settings_dict["NAME"] = allocated
 
@@ -58,7 +57,7 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         # Return the config Django expects for teardown.  The format is a list
         # of (connection, old_name, destroy) tuples.  We set destroy=False
         # because warmdb owns the lifecycle.
-        return [(db, allocated, False)]
+        return [(db, original_name, False)]
 
     def teardown_databases(self, old_config, **kwargs):
         self.keepdb = True
@@ -73,6 +72,8 @@ class WarmDBDiscoverRunner(DiscoverRunner):
         name = self._warmdb_allocated_name
         if not name:
             return
+
+        self._warmdb_allocated_name = None
 
         # Ensure we are disconnected from the clone before dropping.
         connections["default"].close()

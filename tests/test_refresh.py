@@ -29,6 +29,7 @@ def test_refresh_schema_mismatch_triggers_reinit(tmp_path: Path, monkeypatch):
         pool_size: int = 5,
         prefix: str = "warmdb",
         force: bool = False,
+        log=None,
     ) -> None:
         calls.append(
             (

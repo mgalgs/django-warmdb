@@ -262,10 +262,7 @@ def refresh_pool(
                 )
 
             invalidate_pool(alias=alias)
-            if log:
-                init_pool(alias=alias, pool_size=pool_size, prefix=prefix, log=log)
-            else:
-                init_pool(alias=alias, pool_size=pool_size, prefix=prefix)
+            init_pool(alias=alias, pool_size=pool_size, prefix=prefix, log=log)
             return
 
         template = state.get_meta("template_db_name")
@@ -310,8 +307,11 @@ def refresh_pool(
 
         # Backfill missing rows if state is short for any reason.
         if len(existing_clones) < pool_size:
-            for i in range(len(existing_clones) + 1, pool_size + 1):
+            existing_names = {c.name for c in existing_clones}
+            for i in range(1, pool_size + 1):
                 name = clone_db_name(prefix, current_hash, i)
+                if name in existing_names:
+                    continue
                 if log:
                     log(f"warmdb refresh: creating missing clone {name}")
                 create_database_from_template(alias, name, template)
