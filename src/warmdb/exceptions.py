@@ -16,3 +16,11 @@ class WarmDBNoReadyDB(WarmDBError):
 
 class WarmDBUnsupported(WarmDBError):
     pass
+
+
+class WarmDBSnapshotNotFound(WarmDBError):
+    pass
+
+
+class WarmDBSnapshotHasClones(WarmDBError):
+    pass

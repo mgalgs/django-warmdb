@@ -26,6 +26,22 @@ OP_INVALIDATE = "invalidate"
 
 
 @dataclass(frozen=True)
+class SnapshotRow:
+    name: str
+    label: str
+    source_db: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class SnapshotCloneRow:
+    name: str
+    snapshot_label: str
+    clone_label: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class DBRow:
     name: str
     status: str
@@ -394,3 +410,158 @@ class WarmDBState:
                     f"(timeout after {wait_timeout_seconds}s)"
                 )
             time.sleep(poll_interval_seconds)
+
+    # ── Snapshot state ────────────────────────────────────────────
+
+    def ensure_snapshot_schema(self) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshots (
+                  name TEXT PRIMARY KEY,
+                  label TEXT NOT NULL UNIQUE,
+                  source_db TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshot_clones (
+                  name TEXT PRIMARY KEY,
+                  snapshot_label TEXT NOT NULL,
+                  clone_label TEXT NOT NULL UNIQUE,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (snapshot_label) REFERENCES snapshots(label)
+                );
+                """
+            )
+
+    def add_snapshot(self, name: str, label: str, source_db: str) -> None:
+        self.ensure_snapshot_schema()
+        created_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO snapshots(name, label, source_db, created_at) VALUES(?, ?, ?, ?)",
+                (name, label, source_db, created_at),
+            )
+
+    def get_snapshot(self, label: str) -> SnapshotRow | None:
+        if not self.exists():
+            return None
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT name, label, source_db, created_at FROM snapshots WHERE label=?",
+                (label,),
+            ).fetchone()
+            if row is None:
+                return None
+            return SnapshotRow(
+                name=row["name"],
+                label=row["label"],
+                source_db=row["source_db"],
+                created_at=row["created_at"],
+            )
+
+    def get_latest_snapshot(self) -> SnapshotRow | None:
+        if not self.exists():
+            return None
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT name, label, source_db, created_at FROM snapshots ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return SnapshotRow(
+                name=row["name"],
+                label=row["label"],
+                source_db=row["source_db"],
+                created_at=row["created_at"],
+            )
+
+    def list_snapshots(self) -> list[SnapshotRow]:
+        if not self.exists():
+            return []
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT name, label, source_db, created_at FROM snapshots ORDER BY created_at"
+            ).fetchall()
+        return [
+            SnapshotRow(
+                name=r["name"],
+                label=r["label"],
+                source_db=r["source_db"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def remove_snapshot(self, label: str) -> None:
+        if not self.exists():
+            return
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM snapshots WHERE label=?", (label,))
+
+    def add_clone(self, name: str, snapshot_label: str, clone_label: str) -> None:
+        self.ensure_snapshot_schema()
+        created_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO snapshot_clones(name, snapshot_label, clone_label, created_at) VALUES(?, ?, ?, ?)",
+                (name, snapshot_label, clone_label, created_at),
+            )
+
+    def get_clone(self, clone_label: str) -> SnapshotCloneRow | None:
+        if not self.exists():
+            return None
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT name, snapshot_label, clone_label, created_at FROM snapshot_clones WHERE clone_label=?",
+                (clone_label,),
+            ).fetchone()
+            if row is None:
+                return None
+            return SnapshotCloneRow(
+                name=row["name"],
+                snapshot_label=row["snapshot_label"],
+                clone_label=row["clone_label"],
+                created_at=row["created_at"],
+            )
+
+    def list_clones(self, snapshot_label: str | None = None) -> list[SnapshotCloneRow]:
+        if not self.exists():
+            return []
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            if snapshot_label is not None:
+                rows = conn.execute(
+                    "SELECT name, snapshot_label, clone_label, created_at FROM snapshot_clones WHERE snapshot_label=? ORDER BY created_at",
+                    (snapshot_label,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT name, snapshot_label, clone_label, created_at FROM snapshot_clones ORDER BY created_at"
+                ).fetchall()
+        return [
+            SnapshotCloneRow(
+                name=r["name"],
+                snapshot_label=r["snapshot_label"],
+                clone_label=r["clone_label"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def remove_clone(self, clone_label: str) -> None:
+        if not self.exists():
+            return
+        self.ensure_snapshot_schema()
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM snapshot_clones WHERE clone_label=?", (clone_label,)
+            )
