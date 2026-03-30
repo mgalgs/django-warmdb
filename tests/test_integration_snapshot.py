@@ -121,6 +121,26 @@ class TestSnapshotIntegration:
         )
         assert result.returncode != 0
 
+    def test_clone_idempotent(self):
+        """Calling clone twice with the same label reuses the existing clone."""
+        self._run("warmdb", "snapshot", "create", "--label", "idempotent")
+
+        r1 = self._run(
+            "warmdb", "snapshot", "clone", "wt-idem", "--snapshot", "idempotent"
+        )
+        assert r1.returncode == 0, r1.stdout + "\n" + r1.stderr
+
+        r2 = self._run(
+            "warmdb", "snapshot", "clone", "wt-idem", "--snapshot", "idempotent"
+        )
+        assert r2.returncode == 0, r2.stdout + "\n" + r2.stderr
+
+        # Both should output the same DB name
+        assert r1.stdout.strip() == r2.stdout.strip()
+
+        # Clean up
+        self._run("warmdb", "snapshot", "drop", "idempotent", "--cascade")
+
     def test_prune_keeps_recent(self):
         self._run("warmdb", "snapshot", "create", "--label", "old1")
         self._run("warmdb", "snapshot", "create", "--label", "old2")

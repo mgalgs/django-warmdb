@@ -78,6 +78,12 @@ def clone_snapshot(
                 "No snapshots exist. " "Run: manage.py warmdb snapshot create"
             )
 
+    existing = state.get_clone(clone_label)
+    if existing is not None:
+        if log:
+            log(f"Clone '{clone_label}' already exists, reusing (db={existing.name})")
+        return existing
+
     db_name = snapshot_clone_db_name(snap.label, clone_label)
 
     if log:
