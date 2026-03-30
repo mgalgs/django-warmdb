@@ -163,10 +163,14 @@ class Command(BaseCommand):
             return
 
         if snap_sub == "clone":
+            # Log to stderr so stdout is clean for scripting
+            clone_log = (
+                self.stderr.write if int(options.get("verbosity", 1)) >= 1 else None
+            )
             clone = clone_snapshot(
                 clone_label=options["clone_label"],
                 snapshot_label=options.get("snapshot_label"),
-                log=log,
+                log=clone_log,
             )
             self.stdout.write(clone.name)
             return
